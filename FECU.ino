@@ -1,3 +1,8 @@
+/*
+ * PROJETO: TELEMETRIA RECU - TRANSMISSOR 2 (FECU - BRAKE / STEER / DIFF / ACC)
+ * VERSÃO: 5.3 (Acelerômetro Z adicionado no ID 0x409)
+ */
+
 #include <mcp_can.h>
 #include <SPI.h>
 #include <SD.h>
@@ -81,7 +86,7 @@ void setup() {
     
     pinMode(PIN_SPD_LF, INPUT_PULLUP);
     pinMode(PIN_SPD_RF, INPUT_PULLUP);
-    pinMode(PIN_AC_DIF, INPUT_PULLUP); // Monitoramento do acionamento
+    pinMode(PIN_AC_DIF, INPUT_PULLUP); 
     
     attachInterrupt(digitalPinToInterrupt(PIN_SPD_LF), isrLF, FALLING);
     attachInterrupt(digitalPinToInterrupt(PIN_SPD_RF), isrRF, FALLING);
@@ -105,7 +110,8 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;pedF;presD;presCM;st;LF;RF;dif_atv;accX");
+            // Cabeçalho atualizado com Y e Z
+            dataFile.println("ms;pedF;presD;presCM;LF;RF;accX;accY;accZ;dif_atv");
             dataFile.flush();
         }
     }
@@ -136,7 +142,7 @@ void vTaskProcessa(void *pvParameters) {
         if (s_cDataUpdate) {
             d.timestamp = millis();
             
-            // Acelerômetro
+            // Acelerômetro (X, Y e Z)
             d.acc[0] = sReg[AX] / 32768.0f * 16.0f;
             d.acc[1] = sReg[AY] / 32768.0f * 16.0f;
             d.acc[2] = sReg[AZ] / 32768.0f * 16.0f;
@@ -145,7 +151,7 @@ void vTaskProcessa(void *pvParameters) {
             d.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
             d.estercamento = analogReadMilliVolts(PIN_STEER);
             d.correnteDif = analogReadMilliVolts(PIN_CUR_DIF);
-            d.acionamentoDif = (digitalRead(PIN_AC_DIF) == LOW); // Lógica invertida se usar Pullup
+            d.acionamentoDif = (digitalRead(PIN_AC_DIF) == LOW); 
 
             // Pressões (MPa)
             auto calcMPa = [](int p) {
@@ -188,11 +194,12 @@ void vTaskEnvio(void *pvParameters) {
             env(0x400, p.pedalFreio);
             env(0x402, p.presDiant);
             env(0x403, p.presCM);
-            env(0x404, p.acc[0]); 
-            env(0x405, p.acc[1]); 
+            env(0x404, p.acc[0]); // Acc X
+            env(0x405, p.acc[1]); // Acc Y
             env(0x406, p.v_LF);
             env(0x407, p.v_RF);
-            env(0x408, (float)p.acionamentoDif); // Novo ID para estado do Diferencial
+            env(0x408, (float)p.acionamentoDif);
+            env(0x409, p.acc[2]); // <--- NOVO: Acc Z no ID 0x409
         }
     }
 }
@@ -204,9 +211,10 @@ void vTaskSD(void *pvParameters) {
     for (;;) {
         if (xQueueReceive(filaSD, &s, portMAX_DELAY)) {
             if (dataFile) {
-                dataFile.printf("%u;%.1f;%.2f;%.2f;%.1f;%.1f;%.1f;%d\n", 
+                // Adicionado acc[1] e acc[2] no log SD
+                dataFile.printf("%u;%.1f;%.2f;%.2f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
                     s.timestamp, s.pedalFreio, s.presDiant, 
-                    s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acionamentoDif);
+                    s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.acionamentoDif);
                 if (++ct >= 50) { dataFile.flush(); ct = 0; }
             }
         }
