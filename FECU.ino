@@ -1,8 +1,3 @@
-/*
- * PROJETO: TELEMETRIA RECU - TRANSMISSOR 2 (FECU - BRAKE / STEER / DIFF / ACC)
- * VERSÃO: 5.3 (Acelerômetro Z adicionado no ID 0x409)
- */
-
 #include <mcp_can.h>
 #include <SPI.h>
 #include <SD.h>
@@ -11,7 +6,13 @@
 #include "wit_c_sdk.h"
 #include "REG.h"
 
-// --- 1. Estruturas e Globais ---
+// --- 1. CONFIGURAÇÃO DE TAXAS (em Milissegundos) ---
+#define TAXA_IMU_MS        14   // ~70Hz (Leitura Wit-Motion e Envio SD)
+#define TAXA_ENVIO_CAN_MS  14   // ~70Hz (Acompanha a taxa do IMU)
+#define TAXA_ANALOG_MS     200   // 5Hz  (Freio, Pressões)
+#define TAXA_VEL_MS        20   // 50Hz  (Velocidade)
+
+// --- 2. Estrutura de Dados e Sincronismo ---
 struct DadosDinamica {
     uint32_t timestamp;
     float pedalFreio;
@@ -22,7 +23,9 @@ struct DadosDinamica {
     float acc[3], gyro[3], angle[3];
 };
 
-QueueHandle_t filaCAN, filaSD;
+DadosDinamica estadoAtual;
+SemaphoreHandle_t xMutexEstado;
+QueueHandle_t filaSD;
 File dataFile;
 char nomeArquivo[20];
 
@@ -30,8 +33,8 @@ char nomeArquivo[20];
 extern "C" { extern int16_t sReg[REGSIZE]; }
 static volatile char s_cDataUpdate = 0;
 
-// --- 2. Definições de Pinos ---
-#define PIN_PEDAL_F    36   // SENSOR_VP
+// --- 3. Definições de Pinos ---
+#define PIN_PEDAL_F    36
 #define PIN_PRES_D     35
 #define PIN_PRES_CM    32
 #define PIN_STEER      33
@@ -49,11 +52,10 @@ MCP_CAN CAN0(CAN_CS);
 
 #define SD_CS 5
 
-// Variáveis de Interrupção para Velocidade
 volatile unsigned long deltaLF = 0, deltaRF = 0;
 volatile unsigned long lastLF = 0, lastRF = 0;
 
-// --- 3. ISRs Velocidade ---
+// --- 4. ISRs Velocidade ---
 void IRAM_ATTR isrLF() {
     unsigned long agora = micros();
     if (agora - lastLF > 1000) { deltaLF = agora - lastLF; lastLF = agora; }
@@ -63,7 +65,7 @@ void IRAM_ATTR isrRF() {
     if (agora - lastRF > 1000) { deltaRF = agora - lastRF; lastRF = agora; }
 }
 
-// --- 4. Helpers Wit-Motion ---
+// --- 5. Helpers Wit-Motion ---
 static void SensorUartSend(uint8_t *p_data, uint32_t uiSize) { Serial1.write(p_data, uiSize); }
 static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum) {
     for(int i = 0; i < uiRegNum; i++) {
@@ -75,15 +77,20 @@ static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum) {
 }
 static void Delayms(uint16_t ucMs) { vTaskDelay(pdMS_TO_TICKS(ucMs)); }
 
-// --- Protótipos ---
-void vTaskProcessa(void *pvParameters);
-void vTaskEnvio(void *pvParameters);
+// --- 6. Protótipos das Tasks e Funções ---
+void vTaskIMU(void *pvParameters);
+void vTaskAnalogicos(void *pvParameters);
+void vTaskVelocidade(void *pvParameters);
 void vTaskSD(void *pvParameters);
+void vTaskEnvioCAN(void *pvParameters);
+
+float lerPressaoMPa(int pino);
+void enviarMsgCAN(uint32_t id, float valor);
 
 // -------------------------------------------------------------------
+// SETUP
+// -------------------------------------------------------------------
 void setup() {
-    Serial.begin(921600);
-    
     pinMode(PIN_SPD_LF, INPUT_PULLUP);
     pinMode(PIN_SPD_RF, INPUT_PULLUP);
     pinMode(PIN_AC_DIF, INPUT_PULLUP); 
@@ -110,11 +117,13 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            // Cabeçalho atualizado com Y e Z
             dataFile.println("ms;pedF;presD;presCM;LF;RF;accX;accY;accZ;dif_atv");
             dataFile.flush();
         }
     }
+
+    xMutexEstado = xSemaphoreCreateMutex();
+    filaSD = xQueueCreate(100, sizeof(DadosDinamica));
 
     esp_task_wdt_config_t twdt_config = {
         .timeout_ms = 5000,
@@ -123,100 +132,142 @@ void setup() {
     };
     esp_task_wdt_init(&twdt_config);
 
-    filaCAN = xQueueCreate(10, sizeof(DadosDinamica));
-    filaSD = xQueueCreate(30, sizeof(DadosDinamica));
-
-    xTaskCreatePinnedToCore(vTaskProcessa, "Proc", 8192, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskSD, "SD", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskEnvio, "CAN", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskIMU,        "IMU",   4096, NULL, 4, NULL, 0); 
+    xTaskCreatePinnedToCore(vTaskAnalogicos, "Ana",   3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskVelocidade, "Vel",   3072, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskSD,         "SD",    4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(vTaskEnvioCAN,   "CAN",   4096, NULL, 2, NULL, 1);
 }
 
 void loop() { vTaskDelete(NULL); }
 
-// --- TAREFA PROCESSAMENTO (Core 0) ---
-void vTaskProcessa(void *pvParameters) {
-    DadosDinamica d;
+// -------------------------------------------------------------------
+// TAREFA 1: IMU Wit-Motion (~70Hz) -> MESTRE DO SD
+// -------------------------------------------------------------------
+void vTaskIMU(void *pvParameters) {
     for (;;) {
-        while (Serial1.available()) WitSerialDataIn(Serial1.read());
+        while (Serial1.available()) {
+            WitSerialDataIn(Serial1.read());
+        }
+
+        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        estadoAtual.timestamp = millis();
 
         if (s_cDataUpdate) {
-            d.timestamp = millis();
-            
-            // Acelerômetro (X, Y e Z)
-            d.acc[0] = sReg[AX] / 32768.0f * 16.0f;
-            d.acc[1] = sReg[AY] / 32768.0f * 16.0f;
-            d.acc[2] = sReg[AZ] / 32768.0f * 16.0f;
-
-            // Analógicos e Digital Dif
-            d.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
-            d.estercamento = analogReadMilliVolts(PIN_STEER);
-            d.correnteDif = analogReadMilliVolts(PIN_CUR_DIF);
-            d.acionamentoDif = (digitalRead(PIN_AC_DIF) == LOW); 
-
-            // Pressões (MPa)
-            auto calcMPa = [](int p) {
-                float v = (analogReadMilliVolts(p) / 1000.0f) * 1.5f;
-                float mpa = ((v - 0.5f) * 400.0f) / 145.0f;
-                return (mpa < 0) ? 0.0f : mpa;
-            };
-            d.presDiant = calcMPa(PIN_PRES_D);
-            d.presCM = calcMPa(PIN_PRES_CM);
-
-            // Velocidades Dianteiras
-            noInterrupts();
-            unsigned long dLF = deltaLF; unsigned long dRF = deltaRF;
-            interrupts();
-            d.v_LF = (dLF > 500000) ? 0 : (1.70f * 3.6f) / (dLF / 1000000.0f);
-            d.v_RF = (dRF > 500000) ? 0 : (1.70f * 3.6f) / (dRF / 1000000.0f);
-
-            xQueueSend(filaCAN, &d, 0);
-            xQueueSend(filaSD, &d, 0);
+            estadoAtual.acc[0] = sReg[AX] / 32768.0f * 16.0f;
+            estadoAtual.acc[1] = sReg[AY] / 32768.0f * 16.0f;
+            estadoAtual.acc[2] = sReg[AZ] / 32768.0f * 16.0f;
             s_cDataUpdate = 0;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // Como essa é a tarefa mais rápida, ela envia para o SD para não perder dados
+        xQueueSend(filaSD, &estadoAtual, 0);
+        xSemaphoreGive(xMutexEstado);
+        
+        vTaskDelay(pdMS_TO_TICKS(TAXA_IMU_MS));
     }
 }
 
-// --- TAREFA ENVIO CAN (Core 1) ---
-void vTaskEnvio(void *pvParameters) {
-    DadosDinamica p;
-    esp_task_wdt_add(NULL);
+// -------------------------------------------------------------------
+// TAREFA 2: ANALÓGICOS E PEDAIS (50Hz)
+// -------------------------------------------------------------------
+void vTaskAnalogicos(void *pvParameters) {
     for (;;) {
-        if (xQueueReceive(filaCAN, &p, portMAX_DELAY)) {
-            esp_task_wdt_reset();
-            
-            auto env = [](uint32_t id, float v) {
-                int16_t val = (int16_t)(v * 100.0f);
-                byte b[2] = {(byte)(val >> 8), (byte)(val & 0xFF)};
-                CAN0.sendMsgBuf(id, 0, 2, b);
-            };
+        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        estadoAtual.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
+        estadoAtual.estercamento = analogReadMilliVolts(PIN_STEER);
+        estadoAtual.correnteDif = analogReadMilliVolts(PIN_CUR_DIF);
+        estadoAtual.acionamentoDif = (digitalRead(PIN_AC_DIF) == LOW); 
+        estadoAtual.presDiant = lerPressaoMPa(PIN_PRES_D);
+        estadoAtual.presCM = lerPressaoMPa(PIN_PRES_CM);
+        xSemaphoreGive(xMutexEstado);
 
-            env(0x400, p.pedalFreio);
-            env(0x402, p.presDiant);
-            env(0x403, p.presCM);
-            env(0x404, p.acc[0]); // Acc X
-            env(0x405, p.acc[1]); // Acc Y
-            env(0x406, p.v_LF);
-            env(0x407, p.v_RF);
-            env(0x408, (float)p.acionamentoDif);
-            env(0x409, p.acc[2]); // <--- NOVO: Acc Z no ID 0x409
-        }
+        vTaskDelay(pdMS_TO_TICKS(TAXA_ANALOG_MS));
     }
 }
 
-// --- TAREFA SD (Core 0) ---
+// -------------------------------------------------------------------
+// TAREFA 3: VELOCIDADE DAS RODAS (50Hz)
+// -------------------------------------------------------------------
+void vTaskVelocidade(void *pvParameters) {
+    for (;;) {
+        noInterrupts();
+        unsigned long dLF = deltaLF; 
+        unsigned long dRF = deltaRF;
+        interrupts();
+
+        float v_lf_calc = (dLF > 500000) ? 0 : (1.70f * 3.6f) / (dLF / 1000000.0f);
+        float v_rf_calc = (dRF > 500000) ? 0 : (1.70f * 3.6f) / (dRF / 1000000.0f);
+
+        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        estadoAtual.v_LF = v_lf_calc;
+        estadoAtual.v_RF = v_rf_calc;
+        xSemaphoreGive(xMutexEstado);
+
+        vTaskDelay(pdMS_TO_TICKS(TAXA_VEL_MS));
+    }
+}
+
+// -------------------------------------------------------------------
+// TAREFA 4: SD DATALOGGER
+// -------------------------------------------------------------------
 void vTaskSD(void *pvParameters) {
     DadosDinamica s;
     int ct = 0;
     for (;;) {
         if (xQueueReceive(filaSD, &s, portMAX_DELAY)) {
             if (dataFile) {
-                // Adicionado acc[1] e acc[2] no log SD
                 dataFile.printf("%u;%.1f;%.2f;%.2f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
                     s.timestamp, s.pedalFreio, s.presDiant, 
                     s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.acionamentoDif);
-                if (++ct >= 50) { dataFile.flush(); ct = 0; }
+                
+                // Grava fisicamente no cartão a cada ~71 linhas (1 segundo em 70Hz)
+                if (++ct >= 71) { 
+                    dataFile.flush(); 
+                    ct = 0; 
+                }
             }
         }
     }
+}
+
+// -------------------------------------------------------------------
+// TAREFA 5: ENVIO CAN (Core 1 - ~70Hz)
+// -------------------------------------------------------------------
+void vTaskEnvioCAN(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    for (;;) {
+        esp_task_wdt_reset();
+        
+        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        DadosDinamica p = estadoAtual;
+        xSemaphoreGive(xMutexEstado);
+            
+        enviarMsgCAN(0x400, p.pedalFreio);
+        enviarMsgCAN(0x402, p.presDiant);
+        enviarMsgCAN(0x403, p.presCM);
+        enviarMsgCAN(0x404, p.acc[0]); 
+        enviarMsgCAN(0x405, p.acc[1]); 
+        enviarMsgCAN(0x406, p.v_LF);
+        enviarMsgCAN(0x407, p.v_RF);
+        enviarMsgCAN(0x408, (float)p.acionamentoDif);
+        enviarMsgCAN(0x409, p.acc[2]); 
+
+        vTaskDelay(pdMS_TO_TICKS(TAXA_ENVIO_CAN_MS));
+    }
+}
+
+// -------------------------------------------------------------------
+// FUNÇÕES AUXILIARES
+// -------------------------------------------------------------------
+float lerPressaoMPa(int pino) {
+    float v = (analogReadMilliVolts(pino) / 1000.0f) * 1.5f;
+    float mpa = ((v - 0.5f) * 400.0f) / 145.0f;
+    return (mpa < 0) ? 0.0f : mpa;
+}
+
+void enviarMsgCAN(uint32_t id, float valor) {
+    int16_t val = (int16_t)(valor * 100.0f);
+    byte b[2] = {(byte)(val >> 8), (byte)(val & 0xFF)};
+    CAN0.sendMsgBuf(id, 0, 2, b);
 }
