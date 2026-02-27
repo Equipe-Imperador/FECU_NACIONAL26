@@ -246,12 +246,12 @@ void vTaskEnvioCAN(void *pvParameters) {
         enviarMsgCAN(0x400, p.pedalFreio);
         enviarMsgCAN(0x402, p.presDiant);
         enviarMsgCAN(0x403, p.presCM);
-        enviarMsgCAN(0x404, p.acc[0]); 
-        enviarMsgCAN(0x405, p.acc[1]); 
-        enviarMsgCAN(0x406, p.v_LF);
-        enviarMsgCAN(0x407, p.v_RF);
-        enviarMsgCAN(0x408, (float)p.acionamentoDif);
-        enviarMsgCAN(0x409, p.acc[2]); 
+        enviarMsgCAN(0x404, p.acc[0]); //X
+        enviarMsgCAN(0x405, p.acc[1]); //Y
+		enviarMsgCAN(0x406, p.acc[2]); //Z
+		enviarMsgCAN(0x407, (float)p.acionamentoDif);
+        enviarMsgCAN(0x203, p.v_LF);
+        enviarMsgCAN(0x204, p.v_RF);
 
         vTaskDelay(pdMS_TO_TICKS(TAXA_ENVIO_CAN_MS));
     }
