@@ -9,10 +9,19 @@
 // --- 1. CONFIGURAÇÃO DE TAXAS (em Milissegundos) ---
 #define TAXA_IMU_MS        14   // ~70Hz (Leitura Wit-Motion e Envio SD)
 #define TAXA_ENVIO_CAN_MS  14   // ~70Hz (Acompanha a taxa do IMU)
-#define TAXA_ANALOG_MS     200   // 5Hz  (Freio, Pressões)
-#define TAXA_VEL_MS        20   // 50Hz  (Velocidade)
+#define TAXA_ANALOG_MS     200  // 5Hz  (Freio, Pressões)
+#define TAXA_VEL_MS        20   // 50Hz (Velocidade)
 
-// --- 2. Estrutura de Dados e Sincronismo ---
+// --- 2. CONFIGURAÇÃO MECÂNICA E TIMEOUTS (Velocidade Dianteira) ---
+#define DENTES_DIANT       5
+#define DIAMETRO_DIANTEIRO 0.56f
+#define PI_VAL             3.1415926535f
+const float CIRC_DIANT = PI_VAL * DIAMETRO_DIANTEIRO;
+
+const unsigned long DEBOUNCE_VEL_DIANT = 10000; // 10ms
+const unsigned long TIMEOUT_US         = 800000; // 800ms
+
+// --- 3. Estrutura de Dados e Sincronismo ---
 struct DadosDinamica {
     uint32_t timestamp;
     float pedalFreio;
@@ -33,7 +42,7 @@ char nomeArquivo[20];
 extern "C" { extern int16_t sReg[REGSIZE]; }
 static volatile char s_cDataUpdate = 0;
 
-// --- 3. Definições de Pinos ---
+// --- 4. Definições de Pinos ---
 #define PIN_PEDAL_F    36
 #define PIN_PRES_D     35
 #define PIN_PRES_CM    32
@@ -52,20 +61,32 @@ MCP_CAN CAN0(CAN_CS);
 
 #define SD_CS 5
 
-volatile unsigned long deltaLF = 0, deltaRF = 0;
-volatile unsigned long lastLF = 0, lastRF = 0;
+// --- Variáveis Voláteis (ISRs Velocidade) ---
+volatile unsigned long deltaLF = 0, lastLF = 0, anteriorLF = 0;
+volatile unsigned long deltaRF = 0, lastRF = 0, anteriorRF = 0;
 
-// --- 4. ISRs Velocidade ---
+// --- 5. ISRs Velocidade ---
 void IRAM_ATTR isrLF() {
-    unsigned long agora = micros();
-    if (agora - lastLF > 1000) { deltaLF = agora - lastLF; lastLF = agora; }
-}
-void IRAM_ATTR isrRF() {
-    unsigned long agora = micros();
-    if (agora - lastRF > 1000) { deltaRF = agora - lastRF; lastRF = agora; }
+    unsigned long t = micros(); 
+    unsigned long d = t - anteriorLF;
+    if (d > DEBOUNCE_VEL_DIANT) { 
+        deltaLF = d; 
+        anteriorLF = t; 
+        lastLF = t; 
+    }
 }
 
-// --- 5. Helpers Wit-Motion ---
+void IRAM_ATTR isrRF() {
+    unsigned long t = micros(); 
+    unsigned long d = t - anteriorRF;
+    if (d > DEBOUNCE_VEL_DIANT) { 
+        deltaRF = d; 
+        anteriorRF = t; 
+        lastRF = t; 
+    }
+}
+
+// --- 6. Helpers Wit-Motion ---
 static void SensorUartSend(uint8_t *p_data, uint32_t uiSize) { Serial1.write(p_data, uiSize); }
 static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum) {
     for(int i = 0; i < uiRegNum; i++) {
@@ -77,7 +98,7 @@ static void SensorDataUpdata(uint32_t uiReg, uint32_t uiRegNum) {
 }
 static void Delayms(uint16_t ucMs) { vTaskDelay(pdMS_TO_TICKS(ucMs)); }
 
-// --- 6. Protótipos das Tasks e Funções ---
+// --- 7. Protótipos das Tasks e Funções ---
 void vTaskIMU(void *pvParameters);
 void vTaskAnalogicos(void *pvParameters);
 void vTaskVelocidade(void *pvParameters);
@@ -95,8 +116,9 @@ void setup() {
     pinMode(PIN_SPD_RF, INPUT_PULLUP);
     pinMode(PIN_AC_DIF, INPUT_PULLUP); 
     
-    attachInterrupt(digitalPinToInterrupt(PIN_SPD_LF), isrLF, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_SPD_RF), isrRF, FALLING);
+    // Atualizado para RISING conforme sua lógica
+    attachInterrupt(digitalPinToInterrupt(PIN_SPD_LF), isrLF, RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_SPD_RF), isrRF, RISING);
 
     Serial1.begin(921600, SERIAL_8N1, JY901_RX, JY901_TX);
     WitInit(WIT_PROTOCOL_NORMAL, 0x50);
@@ -160,7 +182,6 @@ void vTaskIMU(void *pvParameters) {
             s_cDataUpdate = 0;
         }
 
-        // Como essa é a tarefa mais rápida, ela envia para o SD para não perder dados
         xQueueSend(filaSD, &estadoAtual, 0);
         xSemaphoreGive(xMutexEstado);
         
@@ -169,7 +190,7 @@ void vTaskIMU(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------
-// TAREFA 2: ANALÓGICOS E PEDAIS (50Hz)
+// TAREFA 2: ANALÓGICOS E PEDAIS (5Hz)
 // -------------------------------------------------------------------
 void vTaskAnalogicos(void *pvParameters) {
     for (;;) {
@@ -191,19 +212,33 @@ void vTaskAnalogicos(void *pvParameters) {
 // -------------------------------------------------------------------
 void vTaskVelocidade(void *pvParameters) {
     for (;;) {
+        unsigned long agora = micros();
+        
+        // 1. Cópia Atômica
         noInterrupts();
-        unsigned long dLF = deltaLF; 
-        unsigned long dRF = deltaRF;
+        unsigned long sDLF = deltaLF; unsigned long sLLF = lastLF;
+        unsigned long sDRF = deltaRF; unsigned long sLRF = lastRF;
         interrupts();
 
-        float v_lf_calc = (dLF > 500000) ? 0 : (1.70f * 3.6f) / (dLF / 1000000.0f);
-        float v_rf_calc = (dRF > 500000) ? 0 : (1.70f * 3.6f) / (dRF / 1000000.0f);
+        float v_lf_calc = 0, v_rf_calc = 0;
 
+        // 2. Dianteira Esquerda
+        if (agora - sLLF < TIMEOUT_US && sDLF > 0) {
+            v_lf_calc = (CIRC_DIANT * 3600000.0f) / (float(sDLF) * DENTES_DIANT);
+        }
+
+        // 3. Dianteira Direita
+        if (agora - sLRF < TIMEOUT_US && sDRF > 0) {
+            v_rf_calc = (CIRC_DIANT * 3600000.0f) / (float(sDRF) * DENTES_DIANT);
+        }
+
+        // 4. Salva no estado global
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.v_LF = v_lf_calc;
         estadoAtual.v_RF = v_rf_calc;
         xSemaphoreGive(xMutexEstado);
 
+        // Roda rigidamente a 50Hz
         vTaskDelay(pdMS_TO_TICKS(TAXA_VEL_MS));
     }
 }
@@ -221,7 +256,6 @@ void vTaskSD(void *pvParameters) {
                     s.timestamp, s.pedalFreio, s.presDiant, 
                     s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.acionamentoDif);
                 
-                // Grava fisicamente no cartão a cada ~71 linhas (1 segundo em 70Hz)
                 if (++ct >= 71) { 
                     dataFile.flush(); 
                     ct = 0; 
@@ -248,8 +282,8 @@ void vTaskEnvioCAN(void *pvParameters) {
         enviarMsgCAN(0x403, p.presCM);
         enviarMsgCAN(0x404, p.acc[0]); //X
         enviarMsgCAN(0x405, p.acc[1]); //Y
-		enviarMsgCAN(0x406, p.acc[2]); //Z
-		enviarMsgCAN(0x407, (float)p.acionamentoDif);
+        enviarMsgCAN(0x406, p.acc[2]); //Z
+        enviarMsgCAN(0x407, (float)p.acionamentoDif);
         enviarMsgCAN(0x203, p.v_LF);
         enviarMsgCAN(0x204, p.v_RF);
 
