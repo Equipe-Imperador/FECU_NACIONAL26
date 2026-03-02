@@ -52,8 +52,8 @@ static volatile char s_cDataUpdate = 0;
 #define PIN_SPD_LF     25
 #define PIN_SPD_RF      4
 
-#define JY901_RX 17
-#define JY901_TX 16
+#define JY901_RX 16
+#define JY901_TX 17
 
 #define CAN_CS 15
 SPIClass SPI_CAN(HSPI);
