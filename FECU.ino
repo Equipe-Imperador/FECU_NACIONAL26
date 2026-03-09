@@ -7,27 +7,27 @@
 #include "REG.h"
 
 // --- 1. CONFIGURAÇÃO DE TAXAS (em Milissegundos) ---
-#define TAXA_IMU_MS        14   // ~70Hz (Leitura Wit-Motion e Envio SD)
-#define TAXA_ENVIO_CAN_MS  14   // ~70Hz (Acompanha a taxa do IMU)
-#define TAXA_ANALOG_MS     200  // 5Hz  (Freio, Pressões)
-#define TAXA_VEL_MS        20   // 50Hz (Velocidade)
+#define TAXA_IMU_MS        14   // ~70Hz 
+#define TAXA_REDE_CAN_MS   10   // Mais rápido para não perder comandos e enviar telemetria (~100Hz max delay)
+#define TAXA_ANALOG_MS     200  // 5Hz  
+#define TAXA_VEL_MS        20   // 50Hz 
 
-// --- 2. CONFIGURAÇÃO MECÂNICA E TIMEOUTS (Velocidade Dianteira) ---
+// --- 2. CONFIGURAÇÃO MECÂNICA E TIMEOUTS ---
 #define DENTES_DIANT       5
 #define DIAMETRO_DIANTEIRO 0.56f
 #define PI_VAL             3.1415926535f
 const float CIRC_DIANT = PI_VAL * DIAMETRO_DIANTEIRO;
 
-const unsigned long DEBOUNCE_VEL_DIANT = 10000; // 10ms
-const unsigned long TIMEOUT_US         = 800000; // 800ms
+const unsigned long DEBOUNCE_VEL_DIANT = 10000; 
+const unsigned long TIMEOUT_US         = 800000; 
 
 // --- 3. Estrutura de Dados e Sincronismo ---
 struct DadosDinamica {
     uint32_t timestamp;
     float pedalFreio;
     float presDiant, presCM;
-    float estercamento, correnteDif;
-    bool acionamentoDif; 
+    float estercamento;
+    bool correnteDif; // Agora é Bool lido do analogico para enviar na CAN
     float v_LF, v_RF;
     float acc[3], gyro[3], angle[3];
 };
@@ -47,10 +47,13 @@ static volatile char s_cDataUpdate = 0;
 #define PIN_PRES_D     35
 #define PIN_PRES_CM    32
 #define PIN_STEER      33
-#define PIN_CUR_DIF    34
-#define PIN_AC_DIF     26   
+#define PIN_CUR_DIF    34      // Leitura analógica da corrente
 #define PIN_SPD_LF     25
-#define PIN_SPD_RF      4
+#define PIN_SPD_RF     4
+
+// Pinos de Acionamento Físico (Relés)
+#define PIN_AC_DIF     26   
+#define PIN_AC_BUZINA  27 // Defina o pino da buzina na FECU   
 
 #define JY901_RX 16
 #define JY901_TX 17
@@ -103,7 +106,7 @@ void vTaskIMU(void *pvParameters);
 void vTaskAnalogicos(void *pvParameters);
 void vTaskVelocidade(void *pvParameters);
 void vTaskSD(void *pvParameters);
-void vTaskEnvioCAN(void *pvParameters);
+void vTaskRedeCAN(void *pvParameters); // Renomeada
 
 float lerPressaoMPa(int pino);
 void enviarMsgCAN(uint32_t id, float valor);
@@ -114,9 +117,13 @@ void enviarMsgCAN(uint32_t id, float valor);
 void setup() {
     pinMode(PIN_SPD_LF, INPUT_PULLUP);
     pinMode(PIN_SPD_RF, INPUT_PULLUP);
-    pinMode(PIN_AC_DIF, INPUT_PULLUP); 
     
-    // Atualizado para RISING conforme sua lógica
+    // Configura Relés como saída e inicia desligados
+    pinMode(PIN_AC_DIF, OUTPUT);
+    digitalWrite(PIN_AC_DIF, LOW);
+    pinMode(PIN_AC_BUZINA, OUTPUT);
+    digitalWrite(PIN_AC_BUZINA, LOW);
+    
     attachInterrupt(digitalPinToInterrupt(PIN_SPD_LF), isrLF, RISING);
     attachInterrupt(digitalPinToInterrupt(PIN_SPD_RF), isrRF, RISING);
 
@@ -152,13 +159,14 @@ void setup() {
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
         .trigger_panic = true
     };
+    esp_task_wdt_deinit();
     esp_task_wdt_init(&twdt_config);
 
     xTaskCreatePinnedToCore(vTaskIMU,        "IMU",   4096, NULL, 4, NULL, 0); 
     xTaskCreatePinnedToCore(vTaskAnalogicos, "Ana",   3072, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(vTaskVelocidade, "Vel",   3072, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(vTaskSD,         "SD",    4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(vTaskEnvioCAN,   "CAN",   4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskRedeCAN,    "CAN",   4096, NULL, 2, NULL, 1);
 }
 
 void loop() { vTaskDelete(NULL); }
@@ -197,8 +205,12 @@ void vTaskAnalogicos(void *pvParameters) {
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
         estadoAtual.estercamento = analogReadMilliVolts(PIN_STEER);
-        estadoAtual.correnteDif = analogReadMilliVolts(PIN_CUR_DIF);
-        estadoAtual.acionamentoDif = (digitalRead(PIN_AC_DIF) == LOW); 
+        
+        // Interpreta a tensão do sensor de corrente como booleano (tem corrente ou não)
+        // Ajuste o limiar (ex: > 500mV = ativo) de acordo com o seu sensor
+        int valorCorrente = analogReadMilliVolts(PIN_CUR_DIF);
+        estadoAtual.correnteDif = (valorCorrente > 500); 
+        
         estadoAtual.presDiant = lerPressaoMPa(PIN_PRES_D);
         estadoAtual.presCM = lerPressaoMPa(PIN_PRES_CM);
         xSemaphoreGive(xMutexEstado);
@@ -214,7 +226,6 @@ void vTaskVelocidade(void *pvParameters) {
     for (;;) {
         unsigned long agora = micros();
         
-        // 1. Cópia Atômica
         noInterrupts();
         unsigned long sDLF = deltaLF; unsigned long sLLF = lastLF;
         unsigned long sDRF = deltaRF; unsigned long sLRF = lastRF;
@@ -222,23 +233,18 @@ void vTaskVelocidade(void *pvParameters) {
 
         float v_lf_calc = 0, v_rf_calc = 0;
 
-        // 2. Dianteira Esquerda
         if (agora - sLLF < TIMEOUT_US && sDLF > 0) {
             v_lf_calc = (CIRC_DIANT * 3600000.0f) / (float(sDLF) * DENTES_DIANT);
         }
-
-        // 3. Dianteira Direita
         if (agora - sLRF < TIMEOUT_US && sDRF > 0) {
             v_rf_calc = (CIRC_DIANT * 3600000.0f) / (float(sDRF) * DENTES_DIANT);
         }
 
-        // 4. Salva no estado global
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
         estadoAtual.v_LF = v_lf_calc;
         estadoAtual.v_RF = v_rf_calc;
         xSemaphoreGive(xMutexEstado);
 
-        // Roda rigidamente a 50Hz
         vTaskDelay(pdMS_TO_TICKS(TAXA_VEL_MS));
     }
 }
@@ -254,7 +260,7 @@ void vTaskSD(void *pvParameters) {
             if (dataFile) {
                 dataFile.printf("%u;%.1f;%.2f;%.2f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
                     s.timestamp, s.pedalFreio, s.presDiant, 
-                    s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.acionamentoDif);
+                    s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.correnteDif);
                 
                 if (++ct >= 71) { 
                     dataFile.flush(); 
@@ -266,28 +272,52 @@ void vTaskSD(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------
-// TAREFA 5: ENVIO CAN (Core 1 - ~70Hz)
+// TAREFA 5: REDE CAN (Envia Dados e Recebe Comandos)
 // -------------------------------------------------------------------
-void vTaskEnvioCAN(void *pvParameters) {
+void vTaskRedeCAN(void *pvParameters) {
     esp_task_wdt_add(NULL);
+    long unsigned int rxId;
+    unsigned char len, rxBuf[8];
+    uint32_t tempoUltimoEnvio = 0;
+
     for (;;) {
         esp_task_wdt_reset();
         
-        xSemaphoreTake(xMutexEstado, portMAX_DELAY);
-        DadosDinamica p = estadoAtual;
-        xSemaphoreGive(xMutexEstado);
-            
-        enviarMsgCAN(0x400, p.pedalFreio);
-        enviarMsgCAN(0x402, p.presDiant);
-        enviarMsgCAN(0x403, p.presCM);
-        enviarMsgCAN(0x404, p.acc[0]); //X
-        enviarMsgCAN(0x405, p.acc[1]); //Y
-        enviarMsgCAN(0x406, p.acc[2]); //Z
-        enviarMsgCAN(0x407, (float)p.acionamentoDif);
-        enviarMsgCAN(0x203, p.v_LF);
-        enviarMsgCAN(0x204, p.v_RF);
+        // 1. ESCUTA COMANDOS DA MECU
+        if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+            CAN0.readMsgBuf(&rxId, &len, rxBuf);
+            if (len == 2) {
+                int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
+                
+                if (rxId == 0x500) { // Comando Diferencial
+                    digitalWrite(PIN_AC_DIF, (valorInt > 0) ? HIGH : LOW);
+                } 
+                else if (rxId == 0x501) { // Comando Buzina
+                    digitalWrite(PIN_AC_BUZINA, (valorInt > 0) ? HIGH : LOW);
+                }
+            }
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(TAXA_ENVIO_CAN_MS));
+        // 2. ENVIA TELEMETRIA (~70Hz)
+        if (millis() - tempoUltimoEnvio >= 14) { 
+            xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+            DadosDinamica p = estadoAtual;
+            xSemaphoreGive(xMutexEstado);
+                
+            enviarMsgCAN(0x400, p.pedalFreio);
+            enviarMsgCAN(0x402, p.presDiant);
+            enviarMsgCAN(0x403, p.presCM);
+            enviarMsgCAN(0x404, p.acc[0]); 
+            enviarMsgCAN(0x405, p.acc[1]); 
+            enviarMsgCAN(0x406, p.acc[2]); 
+            enviarMsgCAN(0x407, (float)p.correnteDif); // Reporta se atracou com sucesso
+            enviarMsgCAN(0x203, p.v_LF);
+            enviarMsgCAN(0x204, p.v_RF);
+            
+            tempoUltimoEnvio = millis();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(TAXA_REDE_CAN_MS));
     }
 }
 
