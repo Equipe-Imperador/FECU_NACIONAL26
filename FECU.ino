@@ -27,7 +27,7 @@ struct DadosDinamica {
     float pedalFreio;
     float presDiant, presCM;
     float estercamento;
-    bool correnteDif; // Agora é Bool lido do analogico para enviar na CAN
+    bool correnteDif; 
     float v_LF, v_RF;
     float acc[3], gyro[3], angle[3];
 };
@@ -36,33 +36,43 @@ DadosDinamica estadoAtual;
 SemaphoreHandle_t xMutexEstado;
 QueueHandle_t filaSD;
 File dataFile;
-char nomeArquivo[20];
+char nomeArquivo[30];
 
 // SDK Wit
 extern "C" { extern int16_t sReg[REGSIZE]; }
 static volatile char s_cDataUpdate = 0;
 
-// --- 4. Definições de Pinos ---
+// --- 4. Definições de Pinos e Hardware ---
 #define PIN_PEDAL_F    36
 #define PIN_PRES_D     35
 #define PIN_PRES_CM    32
 #define PIN_STEER      33
-#define PIN_CUR_DIF    34      // Leitura analógica da corrente
+#define PIN_CUR_DIF    34      
 #define PIN_SPD_LF     25
 #define PIN_SPD_RF     4
 
 // Pinos de Acionamento Físico (Relés)
 #define PIN_AC_DIF     26   
-#define PIN_AC_BUZINA  27 // Defina o pino da buzina na FECU   
+#define PIN_AC_BUZINA  27 
 
 #define JY901_RX 16
 #define JY901_TX 17
 
-#define CAN_CS 15
-SPIClass SPI_CAN(HSPI);
-MCP_CAN CAN0(CAN_CS);
+// Pinos CAN (Serão atrelados ao SPI Global)
+#define CAN_CS   15
+#define CAN_SCK  14
+#define CAN_MISO 12
+#define CAN_MOSI 13
 
-#define SD_CS 5
+// Pinos SD (Serão atrelados ao SPI isolado)
+#define SD_CS   5
+#define SD_SCK  18
+#define SD_MISO 19
+#define SD_MOSI 23
+
+// Instâncias SPI e CAN
+MCP_CAN CAN0(CAN_CS);        // Vai usar o SPI global
+SPIClass sdSPI(HSPI);        // Barramento isolado para o SD
 
 // --- Variáveis Voláteis (ISRs Velocidade) ---
 volatile unsigned long deltaLF = 0, lastLF = 0, anteriorLF = 0;
@@ -106,7 +116,7 @@ void vTaskIMU(void *pvParameters);
 void vTaskAnalogicos(void *pvParameters);
 void vTaskVelocidade(void *pvParameters);
 void vTaskSD(void *pvParameters);
-void vTaskRedeCAN(void *pvParameters); // Renomeada
+void vTaskRedeCAN(void *pvParameters); 
 
 float lerPressaoMPa(int pino);
 void enviarMsgCAN(uint32_t id, float valor);
@@ -115,6 +125,9 @@ void enviarMsgCAN(uint32_t id, float valor);
 // SETUP
 // -------------------------------------------------------------------
 void setup() {
+    Serial.begin(115200);
+    Serial.println("\n[FECU] INICIANDO - MODO DUAL SPI BUS");
+
     pinMode(PIN_SPD_LF, INPUT_PULLUP);
     pinMode(PIN_SPD_RF, INPUT_PULLUP);
     
@@ -133,11 +146,28 @@ void setup() {
     WitRegisterCallBack(SensorDataUpdata);
     WitDelayMsRegister(Delayms);
 
-    SPI_CAN.begin(14, 12, 13, CAN_CS);
-    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) { delay(500); }
-    CAN0.setMode(MCP_NORMAL);
+    // Desativa ambos os chips fisicamente antes de configurar
+    pinMode(CAN_CS, OUTPUT);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(CAN_CS, HIGH);
+    digitalWrite(SD_CS, HIGH);
 
-    if (SD.begin(SD_CS)) {
+    // --- A. BARRAMENTO 1: CAN (Usando objeto SPI Global) ---
+    SPI.begin(CAN_SCK, CAN_MISO, CAN_MOSI, CAN_CS);
+    
+    Serial.print("Iniciando CAN... ");
+    while (CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ) != CAN_OK) { 
+        Serial.println("!!! FALHA !!! Tentando novamente...");
+        delay(500); 
+    }
+    CAN0.setMode(MCP_NORMAL);
+    Serial.println(">>> SUCESSO!");
+
+    // --- B. BARRAMENTO 2: SD CARD (Usando objeto sdSPI isolado) ---
+    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    
+    Serial.print("Iniciando SD... ");
+    if (SD.begin(SD_CS, sdSPI, 4000000)) {
         int n = 1;
         while (n < 1000) {
             sprintf(nomeArquivo, "/FECU_%d.csv", n);
@@ -148,7 +178,10 @@ void setup() {
         if (dataFile) {
             dataFile.println("ms;pedF;presD;presCM;LF;RF;accX;accY;accZ;dif_atv");
             dataFile.flush();
+            Serial.printf(">>> SUCESSO: Gravando em %s\n", nomeArquivo);
         }
+    } else {
+        Serial.println("!!! FALHA OU AUSENTE !!!");
     }
 
     xMutexEstado = xSemaphoreCreateMutex();
@@ -206,8 +239,6 @@ void vTaskAnalogicos(void *pvParameters) {
         estadoAtual.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
         estadoAtual.estercamento = analogReadMilliVolts(PIN_STEER);
         
-        // Interpreta a tensão do sensor de corrente como booleano (tem corrente ou não)
-        // Ajuste o limiar (ex: > 500mV = ativo) de acordo com o seu sensor
         int valorCorrente = analogReadMilliVolts(PIN_CUR_DIF);
         estadoAtual.correnteDif = (valorCorrente > 500); 
         
@@ -283,8 +314,8 @@ void vTaskRedeCAN(void *pvParameters) {
     for (;;) {
         esp_task_wdt_reset();
         
-        // 1. ESCUTA COMANDOS DA MECU
-        if (CAN0.checkReceive() == CAN_MSGAVAIL) {
+        // 1. ESCUTA COMANDOS DA MECU (Usando 'while' para esvaziar o buffer rápido)
+        while (CAN0.checkReceive() == CAN_MSGAVAIL) {
             CAN0.readMsgBuf(&rxId, &len, rxBuf);
             if (len == 2) {
                 int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
@@ -310,7 +341,7 @@ void vTaskRedeCAN(void *pvParameters) {
             enviarMsgCAN(0x404, p.acc[0]); 
             enviarMsgCAN(0x405, p.acc[1]); 
             enviarMsgCAN(0x406, p.acc[2]); 
-            enviarMsgCAN(0x407, (float)p.correnteDif); // Reporta se atracou com sucesso
+            enviarMsgCAN(0x407, (float)p.correnteDif); 
             enviarMsgCAN(0x203, p.v_LF);
             enviarMsgCAN(0x204, p.v_RF);
             
