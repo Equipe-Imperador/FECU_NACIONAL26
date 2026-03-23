@@ -293,8 +293,8 @@ void vTaskSD(void *pvParameters) {
             if (dataFile) {
                 // pedalFreio e estercamento impressos como floats brutos sem casas decimais (%.0f)
                 dataFile.printf("%u;%.0f;%.1f;%.0f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
-                    s.timestamp, s.pedalFreio, s.presDiant, 
-                    s.estercamento, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.correnteDif);
+                s.timestamp, s.pedalFreio, s.presDiant, 
+                s.estercamento, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.correnteDif);
                 
                 if (++ct >= 71) { 
                     dataFile.flush(); 
