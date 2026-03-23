@@ -25,8 +25,8 @@ const unsigned long TIMEOUT_US         = 800000;
 struct DadosDinamica {
     uint32_t timestamp;
     float pedalFreio;
-    float presDiant, presCM;
-    float estercamento;
+    float presDiant;
+    float estercamento; // Substituiu a presCM
     bool correnteDif; 
     float v_LF, v_RF;
     float acc[3], gyro[3], angle[3];
@@ -45,8 +45,7 @@ static volatile char s_cDataUpdate = 0;
 // --- 4. Definições de Pinos e Hardware ---
 #define PIN_PEDAL_F    36
 #define PIN_PRES_D     35
-#define PIN_PRES_CM    32
-#define PIN_STEER      33
+#define PIN_STEER      33 // Pino do Esterçamento
 #define PIN_CUR_DIF    34      
 #define PIN_SPD_LF     25
 #define PIN_SPD_RF     4
@@ -118,7 +117,7 @@ void vTaskVelocidade(void *pvParameters);
 void vTaskSD(void *pvParameters);
 void vTaskRedeCAN(void *pvParameters); 
 
-float lerPressaoMPa(int pino);
+float lerPressaoPSI(int pino);
 void enviarMsgCAN(uint32_t id, float valor);
 
 // -------------------------------------------------------------------
@@ -176,7 +175,8 @@ void setup() {
         }
         dataFile = SD.open(nomeArquivo, FILE_WRITE);
         if (dataFile) {
-            dataFile.println("ms;pedF;presD;presCM;LF;RF;accX;accY;accZ;dif_atv");
+            // Atualizado cabeçalho do SD
+            dataFile.println("ms;pedF;presD;estrc;LF;RF;accX;accY;accZ;dif_atv");
             dataFile.flush();
             Serial.printf(">>> SUCESSO: Gravando em %s\n", nomeArquivo);
         }
@@ -236,14 +236,16 @@ void vTaskIMU(void *pvParameters) {
 void vTaskAnalogicos(void *pvParameters) {
     for (;;) {
         xSemaphoreTake(xMutexEstado, portMAX_DELAY);
+        
+        // Leituras RAW
         estadoAtual.pedalFreio = analogReadMilliVolts(PIN_PEDAL_F);
         estadoAtual.estercamento = analogReadMilliVolts(PIN_STEER);
         
         int valorCorrente = analogReadMilliVolts(PIN_CUR_DIF);
         estadoAtual.correnteDif = (valorCorrente > 500); 
         
-        estadoAtual.presDiant = lerPressaoMPa(PIN_PRES_D);
-        estadoAtual.presCM = lerPressaoMPa(PIN_PRES_CM);
+        // Leitura Pressão PSI
+        estadoAtual.presDiant = lerPressaoPSI(PIN_PRES_D);
         xSemaphoreGive(xMutexEstado);
 
         vTaskDelay(pdMS_TO_TICKS(TAXA_ANALOG_MS));
@@ -289,9 +291,10 @@ void vTaskSD(void *pvParameters) {
     for (;;) {
         if (xQueueReceive(filaSD, &s, portMAX_DELAY)) {
             if (dataFile) {
-                dataFile.printf("%u;%.1f;%.2f;%.2f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
+                // pedalFreio e estercamento impressos como floats brutos sem casas decimais (%.0f)
+                dataFile.printf("%u;%.0f;%.1f;%.0f;%.1f;%.1f;%.2f;%.2f;%.2f;%d\n", 
                     s.timestamp, s.pedalFreio, s.presDiant, 
-                    s.presCM, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.correnteDif);
+                    s.estercamento, s.v_LF, s.v_RF, s.acc[0], s.acc[1], s.acc[2], s.correnteDif);
                 
                 if (++ct >= 71) { 
                     dataFile.flush(); 
@@ -314,16 +317,16 @@ void vTaskRedeCAN(void *pvParameters) {
     for (;;) {
         esp_task_wdt_reset();
         
-        // 1. ESCUTA COMANDOS DA MECU (Usando 'while' para esvaziar o buffer rápido)
+        // 1. ESCUTA COMANDOS DA MECU
         while (CAN0.checkReceive() == CAN_MSGAVAIL) {
             CAN0.readMsgBuf(&rxId, &len, rxBuf);
             if (len == 2) {
                 int16_t valorInt = (rxBuf[0] << 8) | rxBuf[1];
                 
-                if (rxId == 0x500) { // Comando Diferencial
+                if (rxId == 0x500) { 
                     digitalWrite(PIN_AC_DIF, (valorInt > 0) ? HIGH : LOW);
                 } 
-                else if (rxId == 0x501) { // Comando Buzina
+                else if (rxId == 0x501) { 
                     digitalWrite(PIN_AC_BUZINA, (valorInt > 0) ? HIGH : LOW);
                 }
             }
@@ -337,7 +340,7 @@ void vTaskRedeCAN(void *pvParameters) {
                 
             enviarMsgCAN(0x400, p.pedalFreio);
             enviarMsgCAN(0x402, p.presDiant);
-            enviarMsgCAN(0x403, p.presCM);
+            enviarMsgCAN(0x403, p.estercamento); // Assumiu o ID do antigo CM
             enviarMsgCAN(0x404, p.acc[0]); 
             enviarMsgCAN(0x405, p.acc[1]); 
             enviarMsgCAN(0x406, p.acc[2]); 
@@ -355,10 +358,15 @@ void vTaskRedeCAN(void *pvParameters) {
 // -------------------------------------------------------------------
 // FUNÇÕES AUXILIARES
 // -------------------------------------------------------------------
-float lerPressaoMPa(int pino) {
-    float v = (analogReadMilliVolts(pino) / 1000.0f) * 1.5f;
-    float mpa = ((v - 0.5f) * 400.0f) / 145.0f;
-    return (mpa < 0) ? 0.0f : mpa;
+const float FATOR_DIVISOR = 1.66667f; // R1=2.2k, R2=3.3k
+const float MULTIPLICADOR_PSI = 400.0f; // 1600 PSI / 4.0V
+
+float lerPressaoPSI(int pino) {
+    float tensaoPino = analogReadMilliVolts(pino) / 1000.0f;
+    float tensaoSensor = tensaoPino * FATOR_DIVISOR;
+
+    if (tensaoSensor < 0.5f) tensaoSensor = 0.5f;
+    return (tensaoSensor - 0.5f) * MULTIPLICADOR_PSI;
 }
 
 void enviarMsgCAN(uint32_t id, float valor) {
